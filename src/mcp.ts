@@ -455,8 +455,7 @@ function mcp(call: Call): void {
   requireAuth(call);
   if (call.method === 'DELETE') return sendEmpty(call, 204);
   if (call.method !== 'POST') {
-    call.res.setHeader('allow', 'POST, DELETE');
-    return sendRaw(call, 405, JSON.stringify({ jsonrpc: '2.0', id: null, error: { code: INVALID_REQUEST, message: 'This endpoint answers POST; it opens no server stream' } }));
+    return sendRaw(call, 405, JSON.stringify({ jsonrpc: '2.0', id: null, error: { code: INVALID_REQUEST, message: 'This endpoint answers POST; it opens no server stream' } }), { allow: 'POST, DELETE' });
   }
   let message: unknown;
   try {

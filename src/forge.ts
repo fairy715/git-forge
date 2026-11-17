@@ -32,7 +32,7 @@ function identity(): string {
 
 // ---- repositories -----------------------------------------------------------------------------
 
-export function makeRepo(input: { name: unknown; description?: unknown; private?: unknown; visibility?: unknown; default_branch?: unknown; auto_init?: unknown }): Repo {
+export function makeRepo(input: { name?: unknown; description?: unknown; private?: unknown; visibility?: unknown; default_branch?: unknown; auto_init?: unknown }): Repo {
   const name = typeof input.name === 'string' ? input.name.trim() : '';
   if (name === '') throw invalid('Repository creation failed.', [{ resource: 'Repository', code: 'missing_field', field: 'name' }]);
   if (!NAME_RE.test(name) || name === '.' || name === '..') {
@@ -149,7 +149,7 @@ export function writeFile(repo: Repo, input: FileWrite, remove: boolean): FileRe
 
 // ---- labels, issues and comments --------------------------------------------------------------
 
-export function makeLabel(repo: Repo, input: { name: unknown; color?: unknown; description?: unknown }): Label {
+export function makeLabel(repo: Repo, input: { name?: unknown; color?: unknown; description?: unknown }): Label {
   const name = typeof input.name === 'string' ? input.name.trim() : '';
   if (name === '') throw invalid('Validation Failed', [{ resource: 'Label', code: 'missing_field', field: 'name' }]);
   if (repo.labels.has(name.toLowerCase())) throw invalid('Validation Failed', [{ resource: 'Label', code: 'already_exists', field: 'name' }]);
@@ -177,7 +177,7 @@ export function labelsNamed(repo: Repo, names: unknown): Label[] {
   return labels;
 }
 
-export function makeIssue(repo: Repo, input: { title: unknown; body?: unknown; labels?: unknown }): Issue {
+export function makeIssue(repo: Repo, input: { title?: unknown; body?: unknown; labels?: unknown }): Issue {
   const title = typeof input.title === 'string' ? input.title : '';
   if (title.trim() === '') throw invalid('Validation Failed', [{ resource: 'Issue', code: 'missing_field', field: 'title' }]);
   const labels = labelsNamed(repo, input.labels);

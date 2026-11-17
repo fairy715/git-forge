@@ -1,12 +1,12 @@
 // The HTTP plumbing every surface shares: reading a request (body, bearer token, query), JSON and
 // binary replies with the headers GitHub clients look for, and the error shape.
 
-import type { IncomingMessage, ServerResponse } from 'node:http';
 import { gunzipSync, inflateSync } from 'node:zlib';
+import type { Reply, Request } from './wire.ts';
 
 export interface Call {
-  req: IncomingMessage;
-  res: ServerResponse;
+  /** The request's headers, names in lower case. */
+  headers: Record<string, string>;
   method: string;
   /** The path with no query string, percent-escapes left as sent. */
   path: string;
@@ -19,6 +19,8 @@ export interface Call {
   authed: boolean;
   /** Whether it carries any credential at all (a wrong one is "Bad credentials"). */
   hasCredential: boolean;
+  /** What a handler answered; set by the send functions below. */
+  reply: Reply | null;
 }
 
 /** A reply made by throwing: the status, and the JSON error body GitHub would send. */
@@ -38,20 +40,19 @@ export const invalid = (message: string, errors: unknown[] = []): ApiError => ne
 
 const DOCS = 'https://docs.github.com/rest';
 const EXPECTED_TOKEN = process.env.MAKEFUN_SHOP_TOKEN ?? '';
-const BODY_LIMIT = 256 * 1024 * 1024;
+/** The Authorization header the suite sends, compared whole on the fast path. */
+const EXPECTED_BEARER = EXPECTED_TOKEN === '' ? null : `Bearer ${EXPECTED_TOKEN}`;
 
 let served = 0;
 
-/** A request id: unique per reply, and the same sequence on every run. */
-function requestId(): string {
+/** The request-id header line: unique per reply, and the same sequence on every run. */
+function requestIdLine(): string {
   served += 1;
-  const hex = served.toString(16).toUpperCase().padStart(8, '0');
-  return `F0A6:${hex.slice(0, 4)}:${hex.slice(4)}:1D2C3B:${(served * 2654435761 % 4294967296).toString(16).toUpperCase().padStart(8, '0')}`;
+  return `x-github-request-id: F0A6:${(served + 0x10000000).toString(16).toUpperCase()}:1D2C3B\r\n`;
 }
 
 /** The credential a request presents: a bearer or token header, or the password of basic auth. */
-function credentialOf(req: IncomingMessage): string | null {
-  const header = req.headers.authorization;
+function credentialOf(header: string | undefined): string | null {
   if (header === undefined || header === '') return null;
   const space = header.indexOf(' ');
   const scheme = (space < 0 ? header : header.slice(0, space)).toLowerCase();
@@ -67,47 +68,39 @@ function credentialOf(req: IncomingMessage): string | null {
   return value;
 }
 
-export function readCall(req: IncomingMessage, res: ServerResponse, body: Buffer): Call {
-  const url = req.url ?? '/';
+export function readCall(request: Request): Call {
+  const url = request.url;
   const mark = url.indexOf('?');
-  const credential = credentialOf(req);
-  let payload = body;
-  const encoding = req.headers['content-encoding'];
-  if (payload.length > 0 && encoding !== undefined) {
-    if (encoding === 'gzip' || encoding === 'x-gzip') payload = gunzipSync(payload);
-    else if (encoding === 'deflate') payload = inflateSync(payload);
+  const headers = request.headers;
+  const authorization = headers.authorization;
+  let authed = false;
+  let hasCredential = false;
+  if (authorization !== undefined && authorization === EXPECTED_BEARER) {
+    authed = true;
+    hasCredential = true;
+  } else {
+    const credential = credentialOf(authorization);
+    hasCredential = credential !== null && credential !== '';
+    // With no token configured (a local run) any credential is the owner's.
+    authed = hasCredential && (EXPECTED_TOKEN === '' || credential === EXPECTED_TOKEN);
+  }
+  let body = request.body;
+  const encoding = headers['content-encoding'];
+  if (body.length > 0 && encoding !== undefined) {
+    if (encoding === 'gzip' || encoding === 'x-gzip') body = gunzipSync(body);
+    else if (encoding === 'deflate') body = inflateSync(body);
   }
   return {
-    req,
-    res,
-    method: req.method ?? 'GET',
+    headers,
+    method: request.method,
     path: mark < 0 ? url : url.slice(0, mark),
     search: mark < 0 ? '' : url.slice(mark + 1),
-    body: payload,
-    origin: `http://${req.headers.host ?? 'localhost'}`,
-    // With no token configured (a local run) any credential is the owner's.
-    authed: credential !== null && credential !== '' && (EXPECTED_TOKEN === '' || credential === EXPECTED_TOKEN),
-    hasCredential: credential !== null && credential !== '',
+    body,
+    origin: `http://${headers.host ?? 'localhost'}`,
+    authed,
+    hasCredential,
+    reply: null,
   };
-}
-
-/** Collects a request body, refusing one past the limit. */
-export function readBody(req: IncomingMessage): Promise<Buffer> {
-  return new Promise((resolve, reject) => {
-    const chunks: Buffer[] = [];
-    let size = 0;
-    req.on('data', (chunk: Buffer) => {
-      size += chunk.length;
-      if (size > BODY_LIMIT) {
-        reject(new ApiError(413, 'Request body too large'));
-        req.destroy();
-        return;
-      }
-      chunks.push(chunk);
-    });
-    req.on('end', () => resolve(chunks.length === 1 ? chunks[0] : Buffer.concat(chunks)));
-    req.on('error', reject);
-  });
 }
 
 export function query(call: Call): URLSearchParams {
@@ -127,30 +120,26 @@ export function jsonBody(call: Call): Record<string, unknown> {
   return value as Record<string, unknown>;
 }
 
-const JSON_TYPE = 'application/json; charset=utf-8';
+const JSON_HEAD = 'content-type: application/json; charset=utf-8\r\nx-github-media-type: github.v3; format=json\r\n';
+
+function headerLines(headers: Record<string, string> | null): string {
+  if (headers === null) return '';
+  let lines = '';
+  for (const name in headers) lines += `${name}: ${headers[name]}\r\n`;
+  return lines;
+}
 
 /** Sends JSON already serialized. */
 export function sendRaw(call: Call, status: number, body: Buffer | string, headers: Record<string, string> | null = null): void {
-  const res = call.res;
-  res.statusCode = status;
-  res.setHeader('content-type', JSON_TYPE);
-  res.setHeader('content-length', typeof body === 'string' ? Buffer.byteLength(body) : body.length);
-  res.setHeader('x-github-request-id', requestId());
-  res.setHeader('x-github-media-type', 'github.v3; format=json');
-  if (headers !== null) for (const name in headers) res.setHeader(name, headers[name]);
-  res.end(body);
+  call.reply = { status, head: JSON_HEAD + requestIdLine() + headerLines(headers), body };
 }
 
 export function sendJson(call: Call, status: number, value: unknown, headers: Record<string, string> | null = null): void {
-  sendRaw(call, status, JSON.stringify(value), headers);
+  call.reply = { status, head: JSON_HEAD + requestIdLine() + headerLines(headers), body: JSON.stringify(value) };
 }
 
 export function sendEmpty(call: Call, status: number): void {
-  const res = call.res;
-  res.statusCode = status;
-  res.setHeader('x-github-request-id', requestId());
-  res.setHeader('content-length', 0);
-  res.end();
+  call.reply = { status, head: requestIdLine(), body: '' };
 }
 
 export function sendError(call: Call, error: ApiError): void {
@@ -159,13 +148,7 @@ export function sendError(call: Call, error: ApiError): void {
 }
 
 export function sendBytes(call: Call, status: number, type: string, body: Buffer): void {
-  const res = call.res;
-  res.statusCode = status;
-  res.setHeader('content-type', type);
-  res.setHeader('content-length', body.length);
-  res.setHeader('cache-control', 'no-cache, max-age=0, must-revalidate');
-  res.setHeader('x-github-request-id', requestId());
-  res.end(body);
+  call.reply = { status, head: `content-type: ${type}\r\ncache-control: no-cache, max-age=0, must-revalidate\r\n${requestIdLine()}`, body };
 }
 
 /** Throws the 401 a request with no (or a wrong) credential gets. */

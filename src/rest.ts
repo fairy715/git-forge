@@ -2,7 +2,7 @@
 // labels, issues and their comments, and pull requests with their files and merges. Each route
 // reads its input, calls forge.ts, and answers with the view GitHub would.
 
-import { ApiError, invalid, jsonBody, notFound, query, requireAuth, sendEmpty, sendJson, sendPage, sendRaw, type Call } from './http.ts';
+import { ApiError, jsonBody, notFound, query, requireAuth, sendEmpty, sendJson, sendPage, sendRaw, type Call } from './http.ts';
 import {
   editIssue,
   editPull,
@@ -18,7 +18,6 @@ import {
   pullCommits,
   pullFiles,
   removeRef,
-  syncPull,
   touch,
   writeFile,
 } from './forge.ts';
@@ -470,8 +469,5 @@ function pulls(call: Call, method: string, repo: Repo, rest: string[]): void {
     if (rest[1] === 'comments' && method === 'GET') return sendJson(call, 200, []);
     if (rest[1] === 'reviews' && method === 'GET') return sendJson(call, 200, []);
   }
-  syncPull(repo, pull);
   throw notFound();
 }
-
-export { invalid };

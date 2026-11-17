@@ -2,11 +2,12 @@
 // HTTP under /<owner>/<repo>.git, REST under /api/v3, GraphQL at /api/graphql and MCP at /mcp.
 // Whatever a handler throws becomes a JSON error, so no request can take the process down.
 
-import { createServer, type IncomingMessage, type Server, type ServerResponse } from 'node:http';
-import { ApiError, notFound, readBody, readCall, requireAuth, sendBytes, sendError, sendJson, type Call } from './src/http.ts';
+import type { Server } from 'node:net';
+import { ApiError, notFound, readCall, requireAuth, sendBytes, sendError, sendJson, type Call } from './src/http.ts';
 import { advertise, GitRequestError, receivePack, uploadPack } from './src/git/transport.ts';
 import { rest } from './src/rest.ts';
 import { findRepo } from './src/store.ts';
+import { serveHttp, type Reply, type Request } from './src/wire.ts';
 
 type Surface = (call: Call) => void | Promise<void>;
 
@@ -25,7 +26,7 @@ function git(call: Call, owner: string, name: string, action: string): void {
   requireAuth(call);
   const repo = findRepo(decodeURIComponent(owner), decodeURIComponent(name));
   if (repo === null) throw new ApiError(404, 'Repository not found.');
-  const wantsV2 = /version=2/.test(String(call.req.headers['git-protocol'] ?? ''));
+  const wantsV2 = /version=2/.test(call.headers['git-protocol'] ?? '');
   if (action === 'info/refs') {
     if (call.method !== 'GET') throw notFound();
     const service = new URLSearchParams(call.search).get('service');
@@ -60,33 +61,33 @@ function route(call: Call): void | Promise<void> {
   throw notFound();
 }
 
-async function serve(req: IncomingMessage, res: ServerResponse): Promise<void> {
-  let call: Call | null = null;
+const NO_REPLY: Reply = { status: 500, head: 'content-type: application/json; charset=utf-8\r\n', body: '{"message":"Server Error: the route sent no reply"}' };
+
+function failed(call: Call, err: unknown): Reply {
+  if (err instanceof ApiError) sendError(call, err);
+  else sendError(call, new ApiError(500, err instanceof Error ? `Server Error: ${err.message}` : 'Server Error'));
+  return call.reply as Reply;
+}
+
+function serve(request: Request): Reply | Promise<Reply> {
+  let call: Call;
   try {
-    const method = req.method ?? 'GET';
-    const body = method === 'GET' || method === 'HEAD' ? EMPTY : await readBody(req);
-    call = readCall(req, res, body);
-    await route(call);
+    call = readCall(request);
+  } catch {
+    // A body whose Content-Encoding does not decode.
+    const plain = readCall({ ...request, headers: { ...request.headers, 'content-encoding': '' } });
+    return failed(plain, new ApiError(400, 'The request body could not be decoded'));
+  }
+  try {
+    const pending = route(call);
+    if (pending instanceof Promise) return pending.then(() => call.reply ?? NO_REPLY, (err: unknown) => failed(call, err));
+    return call.reply ?? NO_REPLY;
   } catch (err) {
-    if (res.headersSent) {
-      res.end();
-      return;
-    }
-    const fallback = call ?? readCall(req, res, EMPTY);
-    if (err instanceof ApiError) sendError(fallback, err);
-    else sendError(fallback, new ApiError(500, err instanceof Error ? `Server Error: ${err.message}` : 'Server Error'));
+    return failed(call, err);
   }
 }
 
-const EMPTY = Buffer.alloc(0);
-
 /** Builds the server; the caller listens (on an ephemeral port in a trial). */
 export function createApp(): Server {
-  const server = createServer((req, res) => {
-    void serve(req, res);
-  });
-  server.keepAliveTimeout = 120_000;
-  server.headersTimeout = 125_000;
-  server.requestTimeout = 0;
-  return server;
+  return serveHttp(serve);
 }

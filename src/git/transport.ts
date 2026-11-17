@@ -8,7 +8,7 @@ import { buildPack, ingestPack } from './pack.ts';
 import { dropRef, headBranch, nowIso, setRef, type Repo } from '../store.ts';
 
 const AGENT = 'agent=git-forge/1.0';
-const UPLOAD_CAPS_V0 = `side-band-64k shallow no-progress ofs-delta object-format=sha1 ${AGENT}`;
+const UPLOAD_CAPS_V0 = `side-band-64k shallow deepen-relative no-progress ofs-delta object-format=sha1 ${AGENT}`;
 const RECEIVE_CAPS = `report-status delete-refs side-band-64k ofs-delta object-format=sha1 ${AGENT}`;
 /** The most data one side-band packet carries: a 65520-byte pkt-line less its length and band. */
 const BAND_CHUNK = 65515;
@@ -100,7 +100,7 @@ function headOf(repo: Repo): { target: string; oid: string | null } {
 /** GET info/refs: the v2 capability advertisement, or the v0 ref list with the service preamble. */
 export function advertise(repo: Repo, service: 'git-upload-pack' | 'git-receive-pack', v2: boolean): Buffer {
   if (service === 'git-upload-pack' && v2) {
-    return Buffer.concat([pkt('version 2\n'), pkt(`${AGENT}\n`), pkt('ls-refs=unborn\n'), pkt('fetch=shallow\n'), pkt('object-format=sha1\n'), FLUSH]);
+    return Buffer.concat([pkt('version 2\n'), pkt(`${AGENT}\n`), pkt('ls-refs=unborn\n'), pkt('fetch=shallow wait-for-done\n'), pkt('object-format=sha1\n'), FLUSH]);
   }
   const out: Buffer[] = [pkt(`# service=${service}\n`), FLUSH];
   const head = headOf(repo);
@@ -145,6 +145,34 @@ interface FetchAsk {
   haves: string[];
   shallow: string[];
   depth: number | null;
+  /** Whether `depth` counts from the client's present shallow boundary (git fetch --deepen). */
+  relative: boolean;
+}
+
+/** How deep the client's history already goes: the farthest of its shallow commits from the wants. */
+function presentDepth(ask: FetchAsk): number {
+  const boundary = new Set(ask.shallow);
+  let deepest = 0;
+  let level = ask.wants.map((want) => peel(want));
+  const seen = new Set<string>(level);
+  for (let depth = 1; level.length > 0; depth += 1) {
+    const next: string[] = [];
+    for (const at of level) {
+      const object = getObject(at);
+      if (object === undefined || object.type !== 'commit') continue;
+      if (boundary.has(at)) {
+        deepest = Math.max(deepest, depth);
+        continue;
+      }
+      for (const parent of readCommit(at).parents) {
+        if (seen.has(parent)) continue;
+        seen.add(parent);
+        next.push(parent);
+      }
+    }
+    level = next;
+  }
+  return deepest;
 }
 
 interface FetchPlan {
@@ -167,6 +195,7 @@ function addTree(tree: string, into: Set<string>, skip: Set<string> | null): voi
 
 function planFetch(ask: FetchAsk): FetchPlan {
   const clientShallow = new Set(ask.shallow);
+  if (ask.relative && ask.depth !== null) ask.depth += presentDepth(ask);
 
   // What the client already holds: its haves and their history, cut at its shallow boundary.
   const heldCommits = new Set<string>();
@@ -226,10 +255,9 @@ function planFetch(ask: FetchAsk): FetchPlan {
         if (parents.length > 0) shallow.push(at);
         continue;
       }
-      // Without a depth the walk stops at what the client holds; with one it runs to the depth,
-      // since deepening reaches past the client's old boundary.
+      // Without a depth the walk stops at what the client holds; with one it runs to the depth
+      // through held commits too, since deepening reaches past the client's old boundary.
       if (held && ask.depth === null) continue;
-      if (held && !clientShallow.has(at)) continue;
       for (const parent of parents) {
         if (depthOf.has(parent)) continue;
         depthOf.set(parent, depth + 1);
@@ -264,7 +292,7 @@ const answers = new Map<string, Buffer>();
 const ANSWER_CACHE_MAX = 64;
 
 function fetchV2(args: string[]): Buffer {
-  const ask: FetchAsk = { wants: [], haves: [], shallow: [], depth: null };
+  const ask: FetchAsk = { wants: [], haves: [], shallow: [], depth: null, relative: args.includes('deepen-relative') };
   let done = false;
   for (const arg of args) {
     if (arg.startsWith('want ')) ask.wants.push(arg.slice(5).trim());
@@ -275,6 +303,12 @@ function fetchV2(args: string[]): Buffer {
   }
   for (const want of ask.wants) {
     if (!isOid(want) || !hasObject(want)) return Buffer.concat([pkt(`ERR upload-pack: not our ref ${want}\n`), FLUSH]);
+  }
+  if (!done && args.includes('wait-for-done')) {
+    // Negotiation only (git push --negotiate): say which haves are known, and send no pack.
+    const known = ask.haves.filter((have) => hasObject(have));
+    const lines = known.length === 0 ? [pkt('NAK\n')] : known.map((oid) => pkt(`ACK ${oid}\n`));
+    return Buffer.concat([pkt('acknowledgments\n'), ...lines, FLUSH]);
   }
   const plan = planFetch(ask);
   const out: Buffer[] = [];
@@ -297,9 +331,10 @@ function fetchV2(args: string[]): Buffer {
 }
 
 function fetchV0(lines: (string | 'flush' | 'delim')[]): Buffer {
-  const ask: FetchAsk = { wants: [], haves: [], shallow: [], depth: null };
+  const ask: FetchAsk = { wants: [], haves: [], shallow: [], depth: null, relative: false };
   let done = false;
   for (const line of lines) {
+    if (line.startsWith('want ') && / deepen-relative( |$)/.test(line)) ask.relative = true;
     if (line.startsWith('want ')) ask.wants.push(line.slice(5, 45));
     else if (line.startsWith('have ')) ask.haves.push(line.slice(5, 45));
     else if (line.startsWith('shallow ')) ask.shallow.push(line.slice(8, 48));

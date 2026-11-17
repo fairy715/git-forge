@@ -55,6 +55,18 @@ async function untilDone(): Promise<void> {
   }
 }
 
+/**
+ * A forge that exits mid-trial scores nothing, so an error no handler caught is logged and the
+ * process keeps serving; only a failure to start ends it.
+ */
+function stayUp(): void {
+  const note = (kind: string, err: unknown): void => {
+    process.stderr.write(`[forge] ${kind}: ${err instanceof Error ? (err.stack ?? err.message) : String(err)}\n`);
+  };
+  process.on('uncaughtException', (err) => note('uncaught exception', err));
+  process.on('unhandledRejection', (err) => note('unhandled rejection', err));
+}
+
 async function run(): Promise<void> {
   const server = createApp();
   const dev = suite === '' && Number.isInteger(fixedPort) && fixedPort > 0;
@@ -66,6 +78,7 @@ async function run(): Promise<void> {
   const address = server.address();
   if (address === null || typeof address === 'string') throw new Error('the server holds no TCP port');
   process.stdout.write(`[forge] serving on port ${address.port}\n`);
+  stayUp();
   if (dev) {
     // Serve until told to stop.
     await new Promise<void>((resolve) => {

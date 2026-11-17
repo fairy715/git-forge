@@ -67,7 +67,12 @@ async function run(): Promise<void> {
   if (address === null || typeof address === 'string') throw new Error('the server holds no TCP port');
   process.stdout.write(`[forge] serving on port ${address.port}\n`);
   if (dev) {
-    await new Promise<void>(() => {});
+    // Serve until told to stop.
+    await new Promise<void>((resolve) => {
+      process.once('SIGINT', resolve);
+      process.once('SIGTERM', resolve);
+    });
+    server.close();
     return;
   }
   await announce(address.port);

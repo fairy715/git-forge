@@ -3,11 +3,11 @@
 // Whatever a handler throws becomes a JSON error, so no request can take the process down.
 
 import type { Server } from 'node:net';
-import { ApiError, notFound, readCall, requireAuth, sendBytes, sendError, sendJson, type Call } from './src/http.ts';
+import { ApiError, notFound, readCall, requestIdStamp, requireAuth, sendBytes, sendError, sendJson, type Call } from './src/http.ts';
 import { advertise, GitRequestError, receivePack, uploadPack } from './src/git/transport.ts';
 import { rest } from './src/rest.ts';
 import { findRepo } from './src/store.ts';
-import { serveHttp, type Reply, type Request } from './src/wire.ts';
+import { forgetReplies, serveHttp, type Reply, type Request } from './src/wire.ts';
 
 type Surface = (call: Call) => void | Promise<void>;
 
@@ -22,14 +22,23 @@ export function mount(surface: 'graphql' | 'mcp', handler: Surface): void {
 
 const GIT_PATH = /^\/([^/]+)\/([^/]+?)(?:\.git)?\/(info\/refs|git-upload-pack|git-receive-pack)$/;
 
+/** A path segment as text: percent-escapes decoded, when there are any. */
+function segment(text: string): string {
+  return text.includes('%') ? decodeURIComponent(text) : text;
+}
+
 function git(call: Call, owner: string, name: string, action: string): void {
   requireAuth(call);
-  const repo = findRepo(decodeURIComponent(owner), decodeURIComponent(name));
+  const repo = findRepo(segment(owner), segment(name));
   if (repo === null) throw new ApiError(404, 'Repository not found.');
-  const wantsV2 = /version=2/.test(call.headers['git-protocol'] ?? '');
+  const protocol = call.headers['git-protocol'];
+  const wantsV2 = protocol !== undefined && protocol.includes('version=2');
   if (action === 'info/refs') {
     if (call.method !== 'GET') throw notFound();
-    const service = new URLSearchParams(call.search).get('service');
+    // The query is nearly always exactly one of these two; anything else is parsed in full.
+    const search = call.search;
+    const service =
+      search === 'service=git-upload-pack' ? 'git-upload-pack' : search === 'service=git-receive-pack' ? 'git-receive-pack' : new URLSearchParams(search).get('service');
     if (service !== 'git-upload-pack' && service !== 'git-receive-pack') throw new ApiError(403, 'Only the smart HTTP protocol is served.');
     sendBytes(call, 200, `application/x-${service}-advertisement`, advertise(repo, service, wantsV2));
     return;
@@ -69,7 +78,26 @@ function failed(call: Call, err: unknown): Reply {
   return call.reply as Reply;
 }
 
+/**
+ * Whether a request only reads: a GET (HEAD arrives here as GET), or a fetch, which is a POST that
+ * changes nothing. Every other request may change what a read answers.
+ */
+function onlyReads(request: Request): boolean {
+  if (request.method === 'GET') return true;
+  if (request.method !== 'POST') return false;
+  const mark = request.url.indexOf('?');
+  return (mark < 0 ? request.url : request.url.slice(0, mark)).endsWith('/git-upload-pack');
+}
+
+/** Marks a read's reply as good for the same request again (until the next change). */
+function settled(reply: Reply, reads: boolean): Reply {
+  if (reads) reply.repeatable = true;
+  return reply;
+}
+
 function serve(request: Request): Reply | Promise<Reply> {
+  const reads = onlyReads(request);
+  if (!reads) forgetReplies();
   let call: Call;
   try {
     call = readCall(request);
@@ -80,14 +108,17 @@ function serve(request: Request): Reply | Promise<Reply> {
   }
   try {
     const pending = route(call);
-    if (pending instanceof Promise) return pending.then(() => call.reply ?? NO_REPLY, (err: unknown) => failed(call, err));
-    return call.reply ?? NO_REPLY;
+    if (pending instanceof Promise) {
+      // A handler that finishes later may change state after other requests were answered.
+      return pending.then(() => call.reply ?? NO_REPLY, (err: unknown) => failed(call, err)).finally(() => forgetReplies());
+    }
+    return settled(call.reply ?? NO_REPLY, reads);
   } catch (err) {
-    return failed(call, err);
+    return settled(failed(call, err), reads);
   }
 }
 
 /** Builds the server; the caller listens (on an ephemeral port in a trial). */
 export function createApp(): Server {
-  return serveHttp(serve);
+  return serveHttp(serve, requestIdStamp);
 }

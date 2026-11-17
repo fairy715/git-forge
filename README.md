@@ -20,7 +20,7 @@ That serves on port 8787 with no suite to talk to; any bearer token is accepted 
 | --- | --- |
 | `main.ts` | The trial lifecycle: listen, register, wait for done, exit. |
 | `app.ts` | Routing to the four surfaces, and the error boundary. |
-| `src/wire.ts` | HTTP/1.1 on TCP sockets: parsing, keep-alive, single-write replies. |
+| `src/wire.ts` | HTTP/1.1 on TCP sockets: parsing, keep-alive, single-write replies, and repeated reads answered from their last reply until state changes. |
 | `src/http.ts` | Requests and replies as the surfaces see them: auth, JSON, pagination. |
 | `src/store.ts` | The state: repositories, refs, labels, issues, pull requests, the clock. |
 | `src/forge.ts` | The operations every surface shares (create, commit a file, merge, ...). |

@@ -1,8 +1,12 @@
 // The forge's state, all in memory for the life of the process: the token's login, repositories
 // with their refs, labels, issues, comments and pull requests, and a clock that never reads the
 // wall time (so two runs of the same requests leave the same state).
+//
+// Replies to reads are kept for repeats (wire.ts), so the changes every write goes through here
+// (the clock, a new id, a ref, a repository gone, the viewer's name) drop the kept replies.
 
 import { commitOf } from './git/objects.ts';
+import { forgetReplies } from './wire.ts';
 
 export interface Label {
   id: number;
@@ -96,6 +100,7 @@ let seconds = startSeconds();
 /** The next instant: every write advances the clock one second, so creation order is total. */
 export function tick(): number {
   seconds += 1;
+  forgetReplies();
   return seconds;
 }
 
@@ -113,6 +118,7 @@ let nextId = 1000;
 
 export function newId(): number {
   nextId += 1;
+  forgetReplies();
   return nextId;
 }
 
@@ -146,7 +152,11 @@ export function allRepos(): Repo[] {
 export function findRepo(owner: string, name: string): Repo | null {
   const repo = repos.get(name.toLowerCase());
   if (repo === undefined) return null;
-  if (login === null) login = owner;
+  if (login === null) {
+    // The viewer now has a name, which replies given before this one may have lacked.
+    login = owner;
+    forgetReplies();
+  }
   return owner.toLowerCase() === login.toLowerCase() ? repo : null;
 }
 
@@ -182,6 +192,7 @@ export function createRepo(name: string, description: string | null, isPrivate: 
 
 export function deleteRepo(repo: Repo): void {
   repos.delete(repo.name.toLowerCase());
+  forgetReplies();
 }
 
 // ---- refs -------------------------------------------------------------------------------------
@@ -189,11 +200,13 @@ export function deleteRepo(repo: Repo): void {
 export function setRef(repo: Repo, ref: string, oid: string): void {
   repo.refs.set(ref, oid);
   repo.version += 1;
+  forgetReplies();
 }
 
 export function dropRef(repo: Repo, ref: string): void {
   repo.refs.delete(ref);
   repo.version += 1;
+  forgetReplies();
 }
 
 /** The commit a branch points at, or null. */

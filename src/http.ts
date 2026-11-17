@@ -2,7 +2,7 @@
 // binary replies with the headers GitHub clients look for, and the error shape.
 
 import { gunzipSync, inflateSync } from 'node:zlib';
-import type { Reply, Request } from './wire.ts';
+import type { Reply, Request, Stamp } from './wire.ts';
 
 export interface Call {
   /** The request's headers, names in lower case. */
@@ -45,11 +45,33 @@ const EXPECTED_BEARER = EXPECTED_TOKEN === '' ? null : `Bearer ${EXPECTED_TOKEN}
 
 let served = 0;
 
+const ID_OPENING = 'x-github-request-id: F0A6:';
+
+/** The next request id's own part: eight hex digits, counting up from the first reply. */
+function nextId(): string {
+  served += 1;
+  return (served + 0x10000000).toString(16).toUpperCase();
+}
+
 /** The request-id header line: unique per reply, and the same sequence on every run. */
 function requestIdLine(): string {
-  served += 1;
-  return `x-github-request-id: F0A6:${(served + 0x10000000).toString(16).toUpperCase()}:1D2C3B\r\n`;
+  return `${ID_OPENING}${nextId()}:1D2C3B\r\n`;
 }
+
+const ID_OPENING_BYTES = Buffer.from(ID_OPENING, 'latin1');
+const HEAD_END_BYTES = Buffer.from('\r\n\r\n', 'latin1');
+
+/** Gives a reply that is sent again a request id of its own, so that ids stay unique per reply. */
+export const requestIdStamp: Stamp = {
+  locate(reply: Buffer): number {
+    const at = reply.indexOf(ID_OPENING_BYTES);
+    const headEnd = reply.indexOf(HEAD_END_BYTES);
+    return at >= 0 && at < headEnd ? at + ID_OPENING_BYTES.length : -1;
+  },
+  refresh(reply: Buffer, at: number): void {
+    reply.write(nextId(), at, 'latin1');
+  },
+};
 
 /** The credential a request presents: a bearer or token header, or the password of basic auth. */
 function credentialOf(header: string | undefined): string | null {

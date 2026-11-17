@@ -3,6 +3,9 @@
 // the handlers do, so this serves the subset the forge needs itself: request line and headers,
 // bodies by Content-Length or chunked encoding, Expect: 100-continue, HEAD, keep-alive with
 // pipelining in order, and replies that always carry a Content-Length and leave in a single write.
+//
+// A request that only reads is answered again from the bytes of its last reply while nothing has
+// changed: the request's own bytes are the key, so a repeat is recognised before it is parsed.
 
 import { createServer, type Server, type Socket } from 'node:net';
 
@@ -20,6 +23,17 @@ export interface Reply {
   /** Extra header lines, each "name: value\r\n" (content-length is added here). */
   head: string;
   body: Buffer | string;
+  /** Set when the same request would get the same reply until the forge's state next changes. */
+  repeatable?: boolean;
+}
+
+/**
+ * The one field of a reply that differs between two sendings of it (the request id): where it sits
+ * in a reply's bytes (-1 when the reply has none), and how to write the next value there.
+ */
+export interface Stamp {
+  locate(reply: Buffer): number;
+  refresh(reply: Buffer, at: number): void;
 }
 
 export type Handler = (request: Request) => Reply | Promise<Reply>;
@@ -45,6 +59,40 @@ const HEAD_END = Buffer.from('\r\n\r\n', 'latin1');
 const EMPTY: Buffer = Buffer.alloc(0);
 const HEAD_LIMIT = 64 * 1024;
 const BODY_LIMIT = 512 * 1024 * 1024;
+/** A binary reply body up to this size is copied behind its head and sent as one buffer. */
+const SMALL_BODY = 16 * 1024;
+
+// ---- replies kept for repeats ------------------------------------------------------------------
+
+/** Requests longer than this are not looked up (the ones that repeat are short). */
+const REPEAT_REQUEST_LIMIT = 4096;
+const REPEAT_REPLY_LIMIT = 256 * 1024;
+const REPEAT_TOTAL_LIMIT = 32 * 1024 * 1024;
+const REPEAT_COUNT_LIMIT = 4096;
+
+interface Kept {
+  bytes: Buffer;
+  stampAt: number;
+}
+
+/** A request's bytes (as latin1 text) to the reply they last got; emptied on every change of state. */
+const kept = new Map<string, Kept>();
+let keptBytes = 0;
+
+/** Drops every kept reply. Whatever changes what a read would answer calls this. */
+export function forgetReplies(): void {
+  if (kept.size === 0) return;
+  kept.clear();
+  keptBytes = 0;
+}
+
+function keep(key: string, bytes: Buffer, stamp: Stamp | null): void {
+  if (bytes.length > REPEAT_REPLY_LIMIT) return;
+  // Full: start over rather than choose what to drop (a change of state empties it anyway).
+  if (kept.size >= REPEAT_COUNT_LIMIT || keptBytes + bytes.length > REPEAT_TOTAL_LIMIT) forgetReplies();
+  kept.set(key, { bytes, stampAt: stamp === null ? -1 : stamp.locate(bytes) });
+  keptBytes += bytes.length;
+}
 
 interface Parsed {
   request: Request;
@@ -153,21 +201,39 @@ function parseRequest(buffer: Buffer, onContinue: () => void): Parsed | null {
   };
 }
 
-/** Writes a reply; `headOnly` (the answer to a HEAD request) sends the headers and no body. */
-function writeReply(socket: Socket, reply: Reply, close: boolean, headOnly = false): void {
+/**
+ * Writes a reply; `headOnly` (the answer to a HEAD request) sends the headers and no body. With
+ * `whole` the reply goes out as one buffer, which is returned so that it can be sent again.
+ */
+function writeReply(socket: Socket, reply: Reply, close: boolean, headOnly = false, whole = false): Buffer | null {
   const reason = REASONS[reply.status] ?? 'Status';
   const body = reply.body;
   const length = typeof body === 'string' ? Buffer.byteLength(body) : body.length;
   const head = `HTTP/1.1 ${reply.status} ${reason}\r\n${reply.head}content-length: ${length}\r\n${close ? 'connection: close\r\n' : ''}\r\n`;
+  if (whole) {
+    let bytes: Buffer;
+    if (headOnly || length === 0) bytes = Buffer.from(head, 'latin1');
+    else if (typeof body === 'string') bytes = Buffer.from(head + body, 'utf8');
+    else bytes = Buffer.concat([Buffer.from(head, 'latin1'), body]);
+    socket.write(bytes);
+    return bytes;
+  }
   if (headOnly) socket.write(head, 'latin1');
   else if (typeof body === 'string') socket.write(head + body);
   else if (length === 0) socket.write(head, 'latin1');
-  else {
+  else if (length <= SMALL_BODY) {
+    // One buffer and one write: copying a small body costs less than a second queued write.
+    const bytes = Buffer.allocUnsafe(head.length + length);
+    bytes.write(head, 0, 'latin1');
+    body.copy(bytes, head.length);
+    socket.write(bytes);
+  } else {
     socket.cork();
     socket.write(head, 'latin1');
     socket.write(body);
     socket.uncork();
   }
+  return null;
 }
 
 function plain(status: number, message: string): Reply {
@@ -175,13 +241,14 @@ function plain(status: number, message: string): Reply {
 }
 
 /** Serves one connection: requests are answered in the order they arrive, one at a time. */
-function attach(socket: Socket, handler: Handler): void {
+function attach(socket: Socket, handler: Handler, stamp: Stamp | null): void {
   let pending: Buffer = EMPTY;
   let busy = false;
   let continued = false;
   socket.setNoDelay(true);
 
-  const pump = (): void => {
+  // `key` is the text of the chunk being pumped when that chunk may be one whole request.
+  const pump = (key: string | null): void => {
     while (!busy && pending.length > 0 && !socket.destroyed) {
       let parsed: Parsed | null;
       try {
@@ -201,6 +268,9 @@ function attach(socket: Socket, handler: Handler): void {
       continued = false;
       // The request's bytes are copied out only when more data follows them in the buffer.
       const rest = pending.length === parsed.used ? EMPTY : pending.subarray(parsed.used);
+      // The key names this request only when the request is all there was.
+      const name = rest === EMPTY ? key : null;
+      key = null;
       pending = rest;
       const close = parsed.close;
       // HEAD is GET without the body: the handler sees a GET, and only the headers go back.
@@ -222,9 +292,14 @@ function attach(socket: Socket, handler: Handler): void {
         busy = true;
         result.then(finish, (err: unknown) => finish(plain(500, err instanceof Error ? err.message : 'Server Error'))).finally(() => {
           busy = false;
-          pump();
+          pump(null);
         });
         return;
+      }
+      if (name !== null && result.repeatable === true && !close && !socket.destroyed) {
+        const bytes = writeReply(socket, result, false, headOnly, true);
+        if (bytes !== null) keep(name, bytes, stamp);
+        continue;
       }
       finish(result);
       if (close) return;
@@ -232,13 +307,23 @@ function attach(socket: Socket, handler: Handler): void {
   };
 
   socket.on('data', (chunk: Buffer) => {
+    let key: string | null = null;
+    if (pending.length === 0 && !busy && chunk.length <= REPEAT_REQUEST_LIMIT) {
+      key = chunk.toString('latin1');
+      const again = kept.get(key);
+      if (again !== undefined) {
+        if (stamp !== null && again.stampAt >= 0) stamp.refresh(again.bytes, again.stampAt);
+        socket.write(again.bytes);
+        return;
+      }
+    }
     pending = pending.length === 0 ? chunk : Buffer.concat([pending, chunk]);
-    pump();
+    pump(key);
   });
   socket.on('error', () => socket.destroy());
 }
 
-/** A TCP server speaking HTTP/1.1 to `handler`; the caller listens. */
-export function serveHttp(handler: Handler): Server {
-  return createServer({ noDelay: true, keepAlive: true }, (socket) => attach(socket, handler));
+/** A TCP server speaking HTTP/1.1 to `handler`; the caller listens. `stamp` refreshes a repeated reply. */
+export function serveHttp(handler: Handler, stamp: Stamp | null = null): Server {
+  return createServer({ noDelay: true, keepAlive: true }, (socket) => attach(socket, handler, stamp));
 }

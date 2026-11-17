@@ -134,10 +134,6 @@ export function viewerLogin(): string {
   return login ?? 'forge-owner';
 }
 
-export function viewerKnown(): boolean {
-  return login !== null;
-}
-
 // ---- repositories -----------------------------------------------------------------------------
 
 const repos = new Map<string, Repo>();
@@ -156,11 +152,6 @@ export function findRepo(owner: string, name: string): Repo | null {
 
 export function repoByName(name: string): Repo | null {
   return repos.get(name.toLowerCase()) ?? null;
-}
-
-export function repoByNodeId(id: string): Repo | null {
-  for (const repo of repos.values()) if (repo.nodeId === id) return repo;
-  return null;
 }
 
 export function createRepo(name: string, description: string | null, isPrivate: boolean, defaultBranch = 'main'): Repo | null {

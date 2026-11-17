@@ -185,7 +185,3 @@ export function sendPage<T>(call: Call, items: T[], render: (item: T) => unknown
   if (page > 1) links.push(link(1, 'first'), link(Math.min(page - 1, pages), 'prev'));
   sendJson(call, 200, slice.map(render), links.length > 0 ? { link: links.join(', ') } : null);
 }
-
-export function str(value: unknown): string | null {
-  return typeof value === 'string' ? value : null;
-}

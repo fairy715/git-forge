@@ -3,7 +3,7 @@
 // operation throws the ApiError its REST form would answer with.
 
 import { ApiError, invalid, notFound } from './http.ts';
-import { commitOf, getObject, hasObject, isAncestor, isDirMode, mergeBase, readCommit, writeCommit, emptyTree } from './git/objects.ts';
+import { hasObject, isAncestor, isDirMode, mergeBase, readCommit, writeCommit, emptyTree } from './git/objects.ts';
 import { diffTrees, lineCounts, lookupPath, mergeTrees, writeBlob, writePath, type Change } from './git/worktree.ts';
 import {
   branchTip,
@@ -407,13 +407,3 @@ export function editPull(repo: Repo, pull: Pull, input: { title?: unknown; body?
   pull.updatedAt = at;
   return pull;
 }
-
-/** The blob at a path of a commit, with its bytes, or null. */
-export function fileAt(commit: string, path: string): { oid: string; data: Buffer } | null {
-  const found = lookupPath(readCommit(commit).tree, path);
-  if (found === null || isDirMode(found.mode)) return null;
-  const object = getObject(found.oid);
-  return object === undefined ? null : { oid: found.oid, data: object.data };
-}
-
-export { commitOf };

@@ -1,8 +1,8 @@
 // HTTP/1.1 straight on TCP sockets. The forge answers many small requests one after another, and
 // node:http's per-request machinery (streams, header objects, timers) costs several times what
 // the handlers do, so this serves the subset the forge needs itself: request line and headers,
-// bodies by Content-Length or chunked encoding, Expect: 100-continue, keep-alive with pipelining
-// in order, and replies that always carry a Content-Length and leave in a single write.
+// bodies by Content-Length or chunked encoding, Expect: 100-continue, HEAD, keep-alive with
+// pipelining in order, and replies that always carry a Content-Length and leave in a single write.
 
 import { createServer, type Server, type Socket } from 'node:net';
 
@@ -153,12 +153,14 @@ function parseRequest(buffer: Buffer, onContinue: () => void): Parsed | null {
   };
 }
 
-function writeReply(socket: Socket, reply: Reply, close: boolean): void {
+/** Writes a reply; `headOnly` (the answer to a HEAD request) sends the headers and no body. */
+function writeReply(socket: Socket, reply: Reply, close: boolean, headOnly = false): void {
   const reason = REASONS[reply.status] ?? 'Status';
   const body = reply.body;
   const length = typeof body === 'string' ? Buffer.byteLength(body) : body.length;
   const head = `HTTP/1.1 ${reply.status} ${reason}\r\n${reply.head}content-length: ${length}\r\n${close ? 'connection: close\r\n' : ''}\r\n`;
-  if (typeof body === 'string') socket.write(head + body);
+  if (headOnly) socket.write(head, 'latin1');
+  else if (typeof body === 'string') socket.write(head + body);
   else if (length === 0) socket.write(head, 'latin1');
   else {
     socket.cork();
@@ -201,9 +203,12 @@ function attach(socket: Socket, handler: Handler): void {
       const rest = pending.length === parsed.used ? EMPTY : pending.subarray(parsed.used);
       pending = rest;
       const close = parsed.close;
+      // HEAD is GET without the body: the handler sees a GET, and only the headers go back.
+      const headOnly = parsed.request.method === 'HEAD';
+      if (headOnly) parsed.request.method = 'GET';
       const finish = (reply: Reply): void => {
         if (socket.destroyed) return;
-        writeReply(socket, reply, close);
+        writeReply(socket, reply, close, headOnly);
         if (close) socket.end();
       };
       let result: Reply | Promise<Reply>;

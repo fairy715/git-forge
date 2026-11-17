@@ -25,6 +25,11 @@ function pkt(payload: string | Buffer): Buffer {
   return Buffer.concat([Buffer.from((body.length + 4).toString(16).padStart(4, '0'), 'ascii'), body]);
 }
 
+/** A text pkt-line as text, so that a run of them is built as one string and encoded once. */
+function line(payload: string): string {
+  return (Buffer.byteLength(payload) + 4).toString(16).padStart(4, '0') + payload;
+}
+
 interface Packets {
   /** Each data line without its trailing newline; 'flush' and 'delim' mark the control packets. */
   lines: (string | 'flush' | 'delim')[];
@@ -102,7 +107,7 @@ export function advertise(repo: Repo, service: 'git-upload-pack' | 'git-receive-
   if (service === 'git-upload-pack' && v2) {
     return Buffer.concat([pkt('version 2\n'), pkt(`${AGENT}\n`), pkt('ls-refs=unborn\n'), pkt('fetch=shallow wait-for-done\n'), pkt('object-format=sha1\n'), FLUSH]);
   }
-  const out: Buffer[] = [pkt(`# service=${service}\n`), FLUSH];
+  let out = `${line(`# service=${service}\n`)}0000`;
   const head = headOf(repo);
   const caps = service === 'git-upload-pack' ? `${UPLOAD_CAPS_V0} symref=HEAD:${head.target}` : RECEIVE_CAPS;
   const lines: string[] = [];
@@ -111,10 +116,9 @@ export function advertise(repo: Repo, service: 'git-upload-pack' | 'git-receive-
     lines.push(`${ref.oid} ${ref.name}`);
     if (ref.peeled !== null) lines.push(`${ref.peeled} ${ref.name}^{}`);
   }
-  if (lines.length === 0) out.push(pkt(`${ZERO_OID} capabilities^{}\0${caps}\n`));
-  else lines.forEach((line, index) => out.push(pkt(index === 0 ? `${line}\0${caps}\n` : `${line}\n`)));
-  out.push(FLUSH);
-  return Buffer.concat(out);
+  if (lines.length === 0) out += line(`${ZERO_OID} capabilities^{}\0${caps}\n`);
+  else for (let index = 0; index < lines.length; index += 1) out += line(index === 0 ? `${lines[index]}\0${caps}\n` : `${lines[index]}\n`);
+  return Buffer.from(`${out}0000`, 'utf8');
 }
 
 function lsRefs(repo: Repo, args: string[]): Buffer {
@@ -437,25 +441,25 @@ export function receivePack(repo: Repo, body: Buffer): Buffer {
       unpack = err instanceof Error ? err.message.replace(/\s+/g, ' ') : 'unpack failed';
     }
   }
-  const report: Buffer[] = [pkt(`unpack ${unpack}\n`)];
+  let report = line(`unpack ${unpack}\n`);
   let moved = false;
   for (const command of commands) {
     const why = unpack === 'ok' ? refusal(repo, command) : 'unpacker error';
     if (why !== null) {
-      report.push(pkt(`ng ${command.ref} ${why}\n`));
+      report += line(`ng ${command.ref} ${why}\n`);
       continue;
     }
     if (command.after === ZERO_OID) dropRef(repo, command.ref);
     else setRef(repo, command.ref, command.after);
     moved = true;
-    report.push(pkt(`ok ${command.ref}\n`));
+    report += line(`ok ${command.ref}\n`);
   }
-  report.push(FLUSH);
+  report += '0000';
   if (moved) repo.pushedAt = nowIso();
   const wanted = caps.split(' ');
-  if (!wanted.includes('side-band-64k')) return Buffer.concat(report);
+  if (!wanted.includes('side-band-64k')) return Buffer.from(report, 'utf8');
   const out: Buffer[] = [];
-  banded(1, Buffer.concat(report), out);
+  banded(1, Buffer.from(report, 'utf8'), out);
   out.push(FLUSH);
   return Buffer.concat(out);
 }
